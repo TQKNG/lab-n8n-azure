@@ -1,0 +1,205 @@
+name: 00 - Setup Repository
+on:
+  workflow_dispatch:
+    inputs:
+      github_pat:
+        description: 'GitHub Personal Access Token with repo permissions'
+        required: true
+        type: string
+      azure_subscription:
+        description: 'Azure Subscription ID'
+        required: true
+        type: string
+      azure_tenant_id:
+        description: 'Azure Tenant ID'
+        required: true
+        type: string
+      ssh_public_key:
+        description: 'SSH Public Key for Azure VM access'
+        required: true
+        type: string
+      default_region:
+        description: 'Default Azure Region'
+        required: false
+        default: 'eastus'
+        type: choice
+        options:
+          - eastus
+          - westus2
+          - canadacentral
+      github_username:
+        description: 'GitHub username (for branch protection)'
+        required: true
+        type: string
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Validate Github PAT
+        env:
+          GH_TOKEN: ${{inputs.github_pat}}
+        run: |
+          echo "Validating Github PAT..."
+          
+          if gh api user --silent; then
+            echo "Github PAT is valid."
+          else
+            echo "Github PAT is invalid. Please provide a valid token with repo permissions."
+            exit 1
+          fi
+
+      - name: Create repository secrets
+        env:
+          GH_TOKEN: ${{ inputs.github_pat }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "🔐 Creating repository secrets..."
+          
+          # Function to create secret
+          create_secret() {
+            local name=$1
+            local value=$2
+            gh secret set "$name" --body "$value" --repo "$REPO"
+            echo "✅ Created secret: $name"
+          }
+          
+          # Create secrets
+          create_secret "AZURE_SUBSCRIPTION_ID" "${{ inputs.azure_subscription }}"
+          create_secret "AZURE_TENANT_ID" "${{ inputs.azure_tenant_id }}"
+          create_secret "SSH_PUBLIC_KEY" "${{ inputs.ssh_public_key }}"
+          create_secret "GH_PAT" "${{ inputs.github_pat }}"
+          create_secret "AZURE_CLIENT_ID" "placeholder-update-after-oidc-setup"
+          
+          echo ""
+          echo "✅ All secrets created successfully"
+
+      - name: Create repo variables
+        env:
+          GH_TOKEN: ${{ inputs.github_pat }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "📝 Creating repository variables..."
+          
+          # Function to create variable
+          create_variable() {
+            local name=$1
+            local value=$2
+            gh variable set "$name" --body "$value" --repo "$REPO"
+            echo "✅ Set variable: $name=$value"
+          }
+          
+          # Create variables
+          create_variable "AZURE_REGION" "${{ inputs.default_region }}"
+          create_variable "VM_SIZE" "Standard_B2ms"
+          create_variable "RESOURCE_GROUP_NAME" "rg-n8n-prod"
+          create_variable "N8N_VERSION" "latest"
+          
+          echo ""
+          echo "✅ All variables created successfully"
+
+      - name: Create production environment
+        env:
+          GH_TOKEN: ${{ inputs.github_pat }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "🌍 Creating production environment..."
+          
+          # Create environment
+          gh api --method PUT repos/$REPO/environments/production
+          
+          # Generate N8N_ENCRYPTION_KEY (32 characters, base64)
+          N8N_KEY=$(openssl rand -base64 32)
+          
+          # Set environment secret
+          gh secret set N8N_ENCRYPTION_KEY \
+            --env production \
+            --body "$N8N_KEY" \
+            --repo "$REPO"
+          
+          echo "✅ Created environment: production"
+          echo "✅ Generated N8N_ENCRYPTION_KEY"
+
+      - name: Create CODEOWNERS file
+        env:
+          GH_TOKEN: ${{ inputs.github_pat }}
+          OWNER: ${{ inputs.github_username }}
+        run: |
+          echo "👥 Creating CODEOWNERS file..."
+          
+          mkdir -p .github
+          
+          cat > .github/CODEOWNERS << EOF
+          # Default owner for everything
+          * @$OWNER
+          
+          # Critical infrastructure files
+          /infrastructure/** @$OWNER
+          /.github/workflows/** @$OWNER
+          /configuration/** @$OWNER
+          
+          # Documentation
+          /docs/** @$OWNER
+          *.md @$OWNER
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/CODEOWNERS
+          git commit -m "chore: add CODEOWNERS file [skip ci]" || echo "No changes to commit"
+          git push || echo "Nothing to push"
+          
+          echo "✅ CODEOWNERS file created"
+
+      - name: Setup branch protection
+        env:
+          GH_TOKEN: ${{ inputs.github_pat }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ inputs.github_username }}
+        run: |
+          echo "🔒 Setting up branch protection for main..."
+          
+          # Note: Full branch protection requires admin API access
+          # This is a simplified version for personal repos
+          
+          gh api --method PUT \
+            repos/$REPO/branches/main/protection \
+            -f required_status_checks='{"strict":true,"contexts":["security-scan"]}' \
+            -f enforce_admins=false \
+            -f required_pull_request_reviews=null \
+            -f restrictions=null \
+            -F allow_force_pushes=false \
+            -F allow_deletions=false \
+            2>&1 || echo "⚠️  Branch protection requires admin access - skipping"
+          
+          echo "✅ Branch protection configured (if permissions allow)"
+
+      - name: Generate setup summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOFSUM'
+          ## 🎉 Repository Setup Complete
+          
+          ### ✅ Secrets Created
+          - `AZURE_SUBSCRIPTION_ID`
+          - `AZURE_TENANT_ID`
+          - `SSH_PUBLIC_KEY`
+          - `GH_PAT`
+          - `AZURE_CLIENT_ID` (placeholder - will be updated by OIDC workflow)
+          
+          ### 📝 Variables Created
+          - `AZURE_REGION`: ${{ inputs.default_region }}
+          - `VM_SIZE`: Standard_B2ms
+          - `RESOURCE_GROUP_NAME`: rg-n8n-prod
+          - `N8N_VERSION`: latest
+          
+          ### 🌍 Environment Created
+          - **production** (with auto-generated N8N_ENCRYPTION_KEY)
+          
+          ### 👥 CODEOWNERS
+          - Created and assigned to @${{ inputs.github_username }}
+          
+          ### 🔒 Branch Protection
+          - Configured for main branch (if permissions allow)

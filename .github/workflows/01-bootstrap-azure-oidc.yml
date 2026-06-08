@@ -1,0 +1,318 @@
+name: 01 - Bootstrap Azure OIDC
+
+on:
+  workflow_dispatch:
+    inputs:
+      github_repository:
+        description: 'GitHub repository (owner/repo) - leave empty to use current repo'
+        required: false
+        type: string
+      github_environment:
+        description: 'GitHub environment name'
+        required: false
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+          - development
+      force_recreate:
+        description: 'Force recreate OIDC configuration (deletes and recreates)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  bootstrap-oidc:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set repository variable
+        id: set_repo
+        run: |
+          # Use input if provided, otherwise use current repository
+          if [ -n "${{ inputs.github_repository }}" ]; then
+            REPO="${{ inputs.github_repository }}"
+          else
+            REPO="${{ github.repository }}"
+          fi
+          
+          echo "repo=$REPO" >> $GITHUB_OUTPUT
+          echo "Using repository: $REPO"
+      
+      - name: Validate inputs
+        id: validate
+        run: |
+          echo "🔍 Validating inputs..."
+          
+          REPO="${{ steps.set_repo.outputs.repo }}"
+          
+          # Validate format
+          if [[ ! "$REPO" =~ ^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+$ ]]; then
+            echo "❌ Invalid repository format: $REPO"
+            echo "Expected format: owner/repo"
+            exit 1
+          fi
+          
+          echo "repo=$REPO" >> $GITHUB_OUTPUT
+          echo "✅ Repository: $REPO"
+          echo "✅ Environment: ${{ inputs.github_environment }}"
+      
+      - name: Check prerequisites
+        run: |
+          echo "🔍 Checking prerequisites..."
+          
+          # Check if secrets exist
+          if [ -z "${{ secrets.AZURE_SUBSCRIPTION_ID }}" ]; then
+            echo "❌ AZURE_SUBSCRIPTION_ID secret not found"
+            echo "Please run workflow 00-setup-repository.yml first"
+            exit 1
+          fi
+          
+          if [ -z "${{ secrets.AZURE_TENANT_ID }}" ]; then
+            echo "❌ AZURE_TENANT_ID secret not found"
+            echo "Please run workflow 00-setup-repository.yml first"
+            exit 1
+          fi
+          
+          if [ -z "${{ secrets.GH_PAT }}" ]; then
+            echo "❌ GH_PAT secret not found"
+            echo "Please run workflow 00-setup-repository.yml first"
+            exit 1
+          fi
+          
+          echo "✅ All required secrets found"
+      
+      - name: Check existing OIDC configuration
+        id: check_oidc
+        continue-on-error: true
+        run: |
+          echo "🔍 Checking if OIDC is already configured..."
+          
+          # This will fail if OIDC doesn't exist yet (expected on first run)
+          if [ "${{ secrets.AZURE_CLIENT_ID }}" = "placeholder-update-after-oidc-setup" ]; then
+            echo "oidc_exists=false" >> $GITHUB_OUTPUT
+            echo "📝 OIDC not configured (placeholder value detected)"
+          else
+            echo "oidc_exists=true" >> $GITHUB_OUTPUT
+            echo "✅ OIDC appears to be configured"
+            echo "client_id=${{ secrets.AZURE_CLIENT_ID }}" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Generate bootstrap instructions
+        if: steps.check_oidc.outputs.oidc_exists == 'false'
+        run: |
+          REPO="${{ steps.validate.outputs.repo }}"
+          ENV="${{ inputs.github_environment }}"
+          SUB_ID="${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+          TENANT_ID="${{ secrets.AZURE_TENANT_ID }}"
+          
+          cat >> $GITHUB_STEP_SUMMARY << EOFSUM
+          ## ⚠️ OIDC Bootstrap Required
+          
+          OIDC is not yet configured. You must run the following commands **locally** on your machine.
+          
+          ---
+          
+          ### Prerequisites
+          
+          1. **Install Azure CLI** (if not installed):
+             \`\`\`bash
+             # Windows (PowerShell)
+             winget install Microsoft.AzureCLI
+             
+             # macOS
+             brew install azure-cli
+             
+             # Linux
+             curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+             \`\`\`
+          
+          2. **Login to Azure**:
+             \`\`\`bash
+             az login
+             \`\`\`
+          
+          3. **Verify correct subscription**:
+             \`\`\`bash
+             az account show
+             # Should show subscription ID: $SUB_ID
+             
+             # If wrong subscription, set it:
+             az account set --subscription "$SUB_ID"
+             \`\`\`
+          
+          ---
+          
+          ### Bootstrap Commands
+          
+          Copy and run these commands in your terminal:
+          
+          \`\`\`bash
+          # Set variables
+          GITHUB_REPO="$REPO"
+          GITHUB_ENV="$ENV"
+          SUBSCRIPTION_ID="$SUB_ID"
+          TENANT_ID="$TENANT_ID"
+          
+          # 1. Create Azure AD Application
+          echo "🔨 Creating Azure AD application..."
+          APP_ID=\$(az ad app create \\
+            --display-name "github-oidc-n8n-automation" \\
+            --query appId -o tsv)
+          
+          echo "✅ Application ID: \$APP_ID"
+          
+          # 2. Create Service Principal
+          echo "🔨 Creating service principal..."
+          SP_ID=\$(az ad sp create --id \$APP_ID --query id -o tsv)
+          
+          echo "✅ Service Principal ID: \$SP_ID"
+          echo "⏳ Waiting 15 seconds for Azure AD propagation..."
+          sleep 15
+          
+          # 3. Create Federated Credential
+          echo "🔨 Creating federated credential..."
+          az ad app federated-credential create --id \$APP_ID --parameters "{
+            \\"name\\": \\"github-\$GITHUB_ENV\\",
+            \\"issuer\\": \\"https://token.actions.githubusercontent.com\\",
+            \\"subject\\": \\"repo:\$GITHUB_REPO:environment:\$GITHUB_ENV\\",
+            \\"audiences\\": [\\"api://AzureADTokenExchange\\"],
+            \\"description\\": \\"GitHub Actions OIDC for \$GITHUB_ENV environment\\"
+          }"
+          
+          echo "✅ Federated credential created"
+          
+          # 4. Assign Contributor Role
+          echo "🔨 Assigning Contributor role..."
+          az role assignment create \\
+            --assignee \$SP_ID \\
+            --role Contributor \\
+            --scope /subscriptions/\$SUBSCRIPTION_ID
+          
+          echo "✅ Role assigned"
+          
+          # 5. Update GitHub Secret
+          echo "🔨 Updating GitHub secret..."
+          echo "\$APP_ID" | gh secret set AZURE_CLIENT_ID --repo "\$GITHUB_REPO"
+          
+          echo ""
+          echo "=========================================="
+          echo "🎉 OIDC Bootstrap Complete!"
+          echo ""
+          echo "Application ID: \$APP_ID"
+          echo "Service Principal: \$SP_ID"
+          echo ""
+          echo "Next: Re-run this workflow to verify OIDC"
+          \`\`\`
+          
+          ---
+          
+          ### After Running Commands
+          
+          1. **Re-run this workflow**:
+             \`\`\`bash
+             gh workflow run 01-bootstrap-oidc.yml
+             \`\`\`
+          
+          2. **Or verify directly**:
+             \`\`\`bash
+             gh workflow run 02-verify-oidc.yml
+             \`\`\`
+          
+          ---
+          
+          ### Troubleshooting
+          
+          **Error: "Insufficient privileges"**
+          - You need Application Administrator role in Azure AD
+          - Contact your Azure administrator
+          
+          **Error: "Already exists"**
+          - OIDC may already be partially configured
+          - Run with \`force_recreate: true\` to recreate
+          
+          **Error: "gh command not found"**
+          - Install GitHub CLI: https://cli.github.com/
+          - Or manually update secret in GitHub web UI
+          
+          EOFSUM
+          
+          echo ""
+          echo "⚠️  Manual bootstrap required - see workflow summary for instructions"
+          exit 0
+      
+      - name: Verify OIDC configuration
+        if: steps.check_oidc.outputs.oidc_exists == 'true'
+        id: verify_oidc
+        run: |
+          echo "🔍 Verifying existing OIDC configuration..."
+          
+          CLIENT_ID="${{ secrets.AZURE_CLIENT_ID }}"
+          REPO="${{ steps.validate.outputs.repo }}"
+          ENV="${{ inputs.github_environment }}"
+          
+          # We can't verify without being authenticated
+          # This step documents what should exist
+          
+          cat >> $GITHUB_STEP_SUMMARY << EOFSUM
+          ## ✅ OIDC Configuration Detected
+          
+          ### Configuration Details
+          
+          | Property | Value |
+          |----------|-------|
+          | **Application ID** | \`$CLIENT_ID\` |
+          | **GitHub Repository** | $REPO |
+          | **Environment** | $ENV |
+          | **Subscription ID** | \`${{ secrets.AZURE_SUBSCRIPTION_ID }}\` |
+          | **Tenant ID** | \`${{ secrets.AZURE_TENANT_ID }}\` |
+          
+          ### Expected Configuration
+          
+          The following should exist in Azure:
+          
+          1. **Azure AD Application**: \`github-oidc-n8n-automation\`
+          2. **Service Principal**: Created from application
+          3. **Federated Credential**:
+             - Issuer: \`https://token.actions.githubusercontent.com\`
+             - Subject: \`repo:$REPO:environment:$ENV\`
+             - Audiences: \`api://AzureADTokenExchange\`
+          4. **Role Assignment**: Contributor role on subscription
+          
+          ### Verification Steps
+          
+          To verify the configuration is working:
+          
+          1. **Run verification workflow**:
+             \`\`\`bash
+             gh workflow run 02-verify-azure-oidc.yml
+             \`\`\`
+          
+          2. **Or check manually in Azure Portal**:
+             - Go to Azure Active Directory → App registrations
+             - Find application: \`github-oidc-n8n-automation\`
+             - Check Certificates & secrets → Federated credentials
+          
+          ### Force Recreate
+          
+          If you need to recreate the OIDC configuration:
+          
+          \`\`\`bash
+          gh workflow run 01-bootstrap-oidc.yml -f force_recreate=true
+          \`\`\`
+          
+          EOFSUM
+          
+          echo ""
+          echo "✅ OIDC configuration detected"
+          echo ""
+          echo "Application ID: $CLIENT_ID"
+          echo "Next: Run 02-verify-azure-oidc.yml to test authentication"

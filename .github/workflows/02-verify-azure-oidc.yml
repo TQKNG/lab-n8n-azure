@@ -1,0 +1,135 @@
+name: 02 - Verify Azure OIDC
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  verify-oidc:
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4 
+      
+      - name: Azure Login via OIDC
+        uses: azure/login@v1 
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      
+      - name: Verify Azure Access
+        id: verify_access
+        run: |
+          echo "🔍 Verifying Azure access..."
+          echo ""
+          
+          # Get subscription info
+          SUBSCRIPTION_NAME=$(az account show --query name -o tsv)
+          SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          TENANT_ID=$(az account show --query tenantId -o tsv)
+          USER_TYPE=$(az account show --query user.type -o tsv)
+          USER_NAME=$(az account show --query user.name -o tsv)
+          
+          echo "✅ Successfully authenticated to Azure"
+          echo ""
+          echo "📋 Subscription Details:"
+          echo "   Name: $SUBSCRIPTION_NAME"
+          echo "   ID: $SUBSCRIPTION_ID"
+          echo "   Tenant: $TENANT_ID"
+          echo "   Auth Type: $USER_TYPE"
+          echo "   User: $USER_NAME"
+          echo ""
+          
+          # Store for summary
+          echo "subscription_name=$SUBSCRIPTION_NAME" >> $GITHUB_OUTPUT
+          echo "subscription_id=$SUBSCRIPTION_ID" >> $GITHUB_OUTPUT
+          echo "tenant_id=$TENANT_ID" >> $GITHUB_OUTPUT
+          echo "auth_type=$USER_TYPE" >> $GITHUB_OUTPUT
+          echo "user_name=$USER_NAME" >> $GITHUB_OUTPUT
+      
+      - name: Test Permissions
+        id: test_permissions
+        run: |
+          echo "🧪 Testing Azure permissions..."
+          echo ""
+          
+          # Test: List resource groups
+          echo "Test 1: List resource groups"
+          if az group list --output none 2>/dev/null; then
+            RG_COUNT=$(az group list --query "length(@)" -o tsv)
+            echo "✅ Can list resource groups (found $RG_COUNT)"
+            echo "can_list_rg=true" >> $GITHUB_OUTPUT
+            echo "rg_count=$RG_COUNT" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Cannot list resource groups"
+            echo "can_list_rg=false" >> $GITHUB_OUTPUT
+            echo "rg_count=0" >> $GITHUB_OUTPUT
+          fi
+          
+          echo ""
+          
+          # Test: List locations
+          echo "Test 2: List available Azure locations"
+          if LOCATION_COUNT=$(az account list-locations --query "length([?metadata.regionType=='Physical'])" -o tsv 2>/dev/null); then
+            echo "✅ Can list locations (found $LOCATION_COUNT regions)"
+            echo "can_list_locations=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Cannot list locations"
+            echo "can_list_locations=false" >> $GITHUB_OUTPUT
+          fi
+          
+          echo ""
+          
+          # Test: Check Contributor role
+          echo "Test 3: Verify Contributor role"
+          CLIENT_ID="${{ secrets.AZURE_CLIENT_ID }}"
+          
+          ROLE=$(az role assignment list \
+            --assignee $CLIENT_ID \
+            --query "[?roleDefinitionName=='Contributor'].roleDefinitionName" \
+            -o tsv 2>/dev/null | head -n1)
+          
+          if [ "$ROLE" = "Contributor" ]; then
+            echo "✅ Has Contributor role"
+            echo "has_contributor=true" >> $GITHUB_OUTPUT
+            
+            # Get scope
+            SCOPE=$(az role assignment list \
+              --assignee $CLIENT_ID \
+              --query "[?roleDefinitionName=='Contributor'].scope" \
+              -o tsv | head -n1)
+            echo "   Scope: $SCOPE"
+            echo "role_scope=$SCOPE" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️  Contributor role not found"
+            echo "has_contributor=false" >> $GITHUB_OUTPUT
+            echo "role_scope=none" >> $GITHUB_OUTPUT
+          fi
+          
+          echo ""
+          
+          # Test: Check VM quota
+          echo "Test 4: Check VM quota availability"
+          if VM_QUOTA=$(az vm list-usage --location eastus --query "[?name.value=='standardBSFamily'].{Current:currentValue, Limit:limit}" -o tsv 2>/dev/null); then
+            CURRENT=$(echo $VM_QUOTA | awk '{print $1}')
+            LIMIT=$(echo $VM_QUOTA | awk '{print $2}')
+            AVAILABLE=$((LIMIT - CURRENT))
+            echo "✅ Can check VM quota"
+            echo "   Standard B-series: $CURRENT/$LIMIT (available: $AVAILABLE)"
+            echo "has_vm_quota=true" >> $GITHUB_OUTPUT
+            echo "vm_quota_available=$AVAILABLE" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️  Cannot check VM quota"
+            echo "has_vm_quota=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Test Resource Creation
+        id: test_creation
+        run: |
+          echo ""

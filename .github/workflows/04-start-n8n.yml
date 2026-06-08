@@ -1,0 +1,170 @@
+name: 04 - Start N8N
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_group_name:
+        description: 'Resource group containing the VM'
+        required: true
+        type: string
+      environment:
+        description: 'Environment for approval gate'
+        required: false
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+          - development
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  post_dns:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Azure Login via OIDC
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve deployment context
+        id: resolve
+        run: |
+          echo "Resolving VM and domain from resource group..."
+          echo ""
+
+          RG_NAME="${{ inputs.resource_group_name }}"
+
+          VM_COUNT=$(az vm list --resource-group "$RG_NAME" --query "length(@)" -o tsv)
+          if [ -z "$VM_COUNT" ] || [ "$VM_COUNT" -eq 0 ]; then
+            echo "ERROR: No VM found in resource group $RG_NAME"
+            exit 1
+          fi
+
+          if [ "$VM_COUNT" -gt 1 ]; then
+            echo "ERROR: Multiple VMs found in resource group $RG_NAME"
+            echo "Please keep only one VM per resource group for this workflow."
+            az vm list --resource-group "$RG_NAME" --query "[].name" -o tsv
+            exit 1
+          fi
+
+          VM_NAME=$(az vm list --resource-group "$RG_NAME" --query "[0].name" -o tsv)
+          TARGET_IP=$(az vm show -d --resource-group "$RG_NAME" --name "$VM_NAME" --query publicIps -o tsv)
+          DOMAIN_NAME=$(az vm show --resource-group "$RG_NAME" --name "$VM_NAME" --query "tags.Domain" -o tsv)
+
+          if [ -z "$DOMAIN_NAME" ] || [ "$DOMAIN_NAME" = "null" ]; then
+            echo "ERROR: VM tag Domain is missing on $VM_NAME"
+            exit 1
+          fi
+
+          N8N_URL="https://$DOMAIN_NAME"
+
+          echo "vm_name=$VM_NAME" >> $GITHUB_OUTPUT
+          echo "target_ip=$TARGET_IP" >> $GITHUB_OUTPUT
+          echo "domain_name=$DOMAIN_NAME" >> $GITHUB_OUTPUT
+          echo "n8n_url=$N8N_URL" >> $GITHUB_OUTPUT
+
+          echo "VM Name: $VM_NAME"
+          echo "Public IP: $TARGET_IP"
+          echo "Domain: $DOMAIN_NAME"
+          echo "n8n URL: $N8N_URL"
+
+      - name: Confirm DNS resolution
+        run: |
+          echo "Checking DNS before Caddy restart..."
+          echo ""
+
+          DOMAIN="${{ steps.resolve.outputs.domain_name }}"
+          TARGET_IP="${{ steps.resolve.outputs.target_ip }}"
+
+          RESOLVED_CF=$(nslookup "$DOMAIN" 1.1.1.1 2>/dev/null | awk '/^Address: / {print $2}' | tail -n 1)
+          RESOLVED_GOOGLE=$(nslookup "$DOMAIN" 8.8.8.8 2>/dev/null | awk '/^Address: / {print $2}' | tail -n 1)
+
+          echo "Cloudflare (1.1.1.1): ${RESOLVED_CF:-unresolved}"
+          echo "Google (8.8.8.8):     ${RESOLVED_GOOGLE:-unresolved}"
+          echo "Target IP:             $TARGET_IP"
+
+          if [ "$RESOLVED_CF" != "$TARGET_IP" ] || [ "$RESOLVED_GOOGLE" != "$TARGET_IP" ]; then
+            echo "WARNING: DNS has not fully propagated to target IP yet."
+            echo "Continuing because this job was manually triggered/approved."
+          else
+            echo "DNS resolves to target IP"
+          fi
+
+      - name: Restart Caddy on VM
+        run: |
+          echo "Restarting Caddy container on VM..."
+          echo ""
+
+          RESTART_OUTPUT=$(az vm run-command invoke \
+            --resource-group "${{ inputs.resource_group_name }}" \
+            --name "${{ steps.resolve.outputs.vm_name }}" \
+            --command-id RunShellScript \
+            --scripts "set -e; sudo docker restart caddy; sleep 5; sudo docker ps --filter name=caddy; sudo docker logs caddy --tail 50" \
+            --query "value[0].message" \
+            -o tsv)
+
+          echo "$RESTART_OUTPUT"
+          echo ""
+          echo "Caddy restart completed"
+
+      - name: Verify n8n deployment
+        run: |
+          echo "Verifying n8n deployment..."
+          echo ""
+
+          N8N_URL="${{ steps.resolve.outputs.n8n_url }}"
+
+          echo "Testing n8n URL: $N8N_URL"
+          echo ""
+
+          MAX_ATTEMPTS=20
+          ATTEMPT=0
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$N8N_URL" || echo "000")
+
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: HTTP Status = $HTTP_STATUS"
+
+            if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "302" ]; then
+              echo "n8n is responding correctly"
+              break
+            fi
+
+            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+              echo "n8n is not responding yet"
+              echo "This might be normal if SSL certificates are still being provisioned"
+              echo "Check manually: $N8N_URL"
+            fi
+
+            sleep 10
+          done
+
+          echo ""
+          echo "Deployment verification complete"
+
+      - name: Display deployment summary
+        if: always()
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "Post DNS Summary"
+          echo "=========================================="
+          echo ""
+          echo "Resource Group: ${{ inputs.resource_group_name }}"
+          echo "Environment:    ${{ inputs.environment }}"
+          echo "VM Name:        ${{ steps.resolve.outputs.vm_name }}"
+          echo "Public IP:      ${{ steps.resolve.outputs.target_ip }}"
+          echo "Domain:         ${{ steps.resolve.outputs.domain_name }}"
+          echo "n8n URL:        ${{ steps.resolve.outputs.n8n_url }}"
+          echo ""
+          echo "=========================================="

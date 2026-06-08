@@ -1,0 +1,461 @@
+name: 03 - Deploy n8n Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain_name:
+        description: 'Domain name for n8n (e.g., n8n.example.com)'
+        required: true
+        type: string
+      vm_size:
+        description: 'Azure VM size'
+        required: false
+        default: 'Standard_B2ms'
+        type: choice
+        options:
+          - Standard_B1ms
+          - Standard_B2s
+          - Standard_B2ms
+          - Standard_D2s_v3
+          - Standard_D4s_v3
+      azure_region:
+        description: 'Azure region for deployment (leave empty for default)'
+        required: false
+        type: string
+      resource_group_name:
+        description: 'Resource group name (leave empty for default)'
+        required: false
+        type: string
+      n8n_version:
+        description: 'n8n version (latest or specific version like 1.19.0)'
+        required: false
+        default: 'latest'
+        type: string
+      base_name:
+        description: 'Base name for resources (leave empty for default: n8n)'
+        required: false
+        type: string
+      environment:
+        description: 'Environment tag'
+        required: false
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+          - development
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      domain: ${{ steps.validate.outputs.domain }}
+      region: ${{ steps.validate.outputs.region }}
+      rg_name: ${{ steps.validate.outputs.rg_name }}
+      vm_size: ${{ steps.validate.outputs.vm_size }}
+      n8n_version: ${{ steps.validate.outputs.n8n_version }}
+      base_name: ${{ steps.validate.outputs.base_name }}
+      environment: ${{ steps.validate.outputs.environment }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Validate inputs
+        id: validate
+        run: |
+          echo "🔍 Validating deployment inputs..."
+          echo ""
+          
+          # Validate domain name
+          DOMAIN="${{ inputs.domain_name }}"
+          if [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
+            echo "❌ Invalid domain name format: $DOMAIN"
+            echo "Expected format: subdomain.domain.tld (e.g., n8n.example.com)"
+            exit 1
+          fi
+          echo "domain=$DOMAIN" >> $GITHUB_OUTPUT
+          echo "✅ Domain: $DOMAIN"
+          
+          # Set region (use input or default from variables)
+          if [ -n "${{ inputs.azure_region }}" ]; then
+            REGION="${{ inputs.azure_region }}"
+          else
+            REGION="${{ vars.AZURE_REGION }}"
+          fi
+          echo "region=$REGION" >> $GITHUB_OUTPUT
+          echo "✅ Region: $REGION"
+          
+          # Set resource group name
+          if [ -n "${{ inputs.resource_group_name }}" ]; then
+            RG_NAME="${{ inputs.resource_group_name }}"
+          else
+            RG_NAME="${{ vars.RESOURCE_GROUP_NAME }}"
+          fi
+          echo "rg_name=$RG_NAME" >> $GITHUB_OUTPUT
+          echo "✅ Resource Group: $RG_NAME"
+          
+          # Set base name
+          if [ -n "${{ inputs.base_name }}" ]; then
+            BASE_NAME="${{ inputs.base_name }}"
+          else
+            BASE_NAME="n8n"
+          fi
+          
+          # Validate base name (3-10 characters, alphanumeric and hyphens)
+          if [[ ! "$BASE_NAME" =~ ^[a-zA-Z0-9-]{3,10}$ ]]; then
+            echo "❌ Invalid base name: $BASE_NAME"
+            echo "Must be 3-10 characters, alphanumeric and hyphens only"
+            exit 1
+          fi
+          echo "base_name=$BASE_NAME" >> $GITHUB_OUTPUT
+          echo "✅ Base Name: $BASE_NAME"
+          
+          # Validate VM size
+          VM_SIZE="${{ inputs.vm_size }}"
+          echo "vm_size=$VM_SIZE" >> $GITHUB_OUTPUT
+          echo "✅ VM Size: $VM_SIZE"
+          
+          # Validate n8n version
+          N8N_VERSION="${{ inputs.n8n_version }}"
+          echo "n8n_version=$N8N_VERSION" >> $GITHUB_OUTPUT
+          echo "✅ n8n Version: $N8N_VERSION"
+          
+          # Set environment
+          ENVIRONMENT="${{ inputs.environment }}"
+          echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+          echo "✅ Environment: $ENVIRONMENT"
+          
+          echo ""
+          echo "✅ All inputs validated successfully"
+      
+      - name: Validate Bicep templates
+        run: |
+          echo ""
+          echo "🔍 Validating Bicep templates..."
+          echo ""
+          
+          # Validate main template
+          echo "Validating main.bicep..."
+          az bicep build --file infrastructure/main.bicep
+          echo "✅ main.bicep is valid"
+          
+          echo ""
+          
+          # Validate all modules
+          echo "Validating modules..."
+          for module in infrastructure/modules/*.bicep; do
+            MODULE_NAME=$(basename $module)
+            echo "  Checking $MODULE_NAME..."
+            az bicep build --file $module
+            echo "  ✅ $MODULE_NAME"
+          done
+          
+          echo ""
+          echo "✅ All Bicep templates validated successfully"
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: validate
+    environment: ${{ inputs.environment }}
+    outputs:
+      public_ip: ${{ steps.deploy_bicep.outputs.public_ip }}
+      vm_name: ${{ steps.deploy_bicep.outputs.vm_name }}
+      fqdn: ${{ steps.deploy_bicep.outputs.fqdn }}
+      ssh_command: ${{ steps.deploy_bicep.outputs.ssh_command }}
+      n8n_url: ${{ steps.deploy_bicep.outputs.n8n_url }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Azure Login via OIDC
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      
+      - name: Check existing deployment
+        id: check_existing
+        run: |
+          echo "🔍 Checking for existing deployment..."
+          echo ""
+          
+          RG_NAME="${{ needs.validate.outputs.rg_name }}"
+          
+          if az group exists --name "$RG_NAME" | grep -q "true"; then
+            echo "⚠️  Resource group already exists: $RG_NAME"
+            echo "exists=true" >> $GITHUB_OUTPUT
+            
+            # List existing resources
+            RESOURCE_COUNT=$(az resource list --resource-group "$RG_NAME" --query "length(@)" -o tsv)
+            echo "   Resources: $RESOURCE_COUNT"
+            echo "resource_count=$RESOURCE_COUNT" >> $GITHUB_OUTPUT
+            
+            if [ "$RESOURCE_COUNT" -gt 0 ]; then
+              echo ""
+              echo "📋 Existing resources:"
+              az resource list --resource-group "$RG_NAME" \
+                --query "[].{Name:name, Type:type, Location:location}" \
+                --output table
+              
+              # Check for VM
+              VM_COUNT=$(az vm list --resource-group "$RG_NAME" --query "length(@)" -o tsv)
+              if [ "$VM_COUNT" -gt 0 ]; then
+                echo ""
+                echo "⚠️  VM(s) already deployed:"
+                az vm list --resource-group "$RG_NAME" \
+                  --query "[].{Name:name, Size:hardwareProfile.vmSize, Location:location}" \
+                  --output table
+                echo "vm_exists=true" >> $GITHUB_OUTPUT
+              else
+                echo "vm_exists=false" >> $GITHUB_OUTPUT
+              fi
+            fi
+          else
+            echo "✅ Resource group does not exist (clean deployment)"
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "resource_count=0" >> $GITHUB_OUTPUT
+            echo "vm_exists=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Create resource group
+        run: |
+          RG_NAME="${{ needs.validate.outputs.rg_name }}"
+          REGION="${{ needs.validate.outputs.region }}"
+          ENVIRONMENT="${{ needs.validate.outputs.environment }}"
+          
+          if [ "${{ steps.check_existing.outputs.exists }}" = "false" ]; then
+            echo "🔨 Creating resource group: $RG_NAME"
+            az group create \
+              --name "$RG_NAME" \
+              --location "$REGION" \
+              --tags \
+                Project=n8n-automation \
+                ManagedBy=GitHub-Actions \
+                Environment="$ENVIRONMENT" \
+                DeployedAt=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+                DeployedBy="${{ github.actor }}" \
+                Workflow="${{ github.workflow }}" \
+                RunId="${{ github.run_id }}"
+            
+            echo "✅ Resource group created"
+          else
+            echo "✅ Using existing resource group: $RG_NAME"
+            
+            # Update tags
+            echo "📝 Updating resource group tags..."
+            az group update \
+              --name "$RG_NAME" \
+              --tags \
+                Project=n8n-automation \
+                ManagedBy=GitHub-Actions \
+                Environment="$ENVIRONMENT" \
+                LastUpdated=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+                UpdatedBy="${{ github.actor }}" \
+                Workflow="${{ github.workflow }}" \
+                RunId="${{ github.run_id }}"
+            
+            echo "✅ Tags updated"
+          fi
+      
+      - name: Deploy Bicep infrastructure
+        id: deploy_bicep
+        run: |
+          echo "🚀 Deploying n8n infrastructure with Bicep..."
+          echo ""
+          
+          RG_NAME="${{ needs.validate.outputs.rg_name }}"
+          DOMAIN="${{ needs.validate.outputs.domain }}"
+          VM_SIZE="${{ needs.validate.outputs.vm_size }}"
+          N8N_VERSION="${{ needs.validate.outputs.n8n_version }}"
+          BASE_NAME="${{ needs.validate.outputs.base_name }}"
+          ENVIRONMENT="${{ needs.validate.outputs.environment }}"
+          LOCATION="${{ needs.validate.outputs.region }}"
+          SSH_KEY="${{ secrets.SSH_PUBLIC_KEY }}"
+          ENCRYPTION_KEY="${{ secrets.N8N_ENCRYPTION_KEY }}"
+          
+          echo "📋 Deployment Configuration:"
+          echo "   Resource Group: $RG_NAME"
+          echo "   Location: $LOCATION"
+          echo "   Base Name: $BASE_NAME"
+          echo "   Domain: $DOMAIN"
+          echo "   VM Size: $VM_SIZE"
+          echo "   n8n Version: $N8N_VERSION"
+          echo "   Environment: $ENVIRONMENT"
+          echo ""
+          
+          # Generate unique deployment name
+          DEPLOYMENT_NAME="n8n-deploy-$(date +%Y%m%d-%H%M%S)"
+          
+          # Deploy infrastructure
+          echo "🔨 Starting Bicep deployment: $DEPLOYMENT_NAME"
+          echo ""
+          
+          az deployment group create \
+            --resource-group "$RG_NAME" \
+            --name "$DEPLOYMENT_NAME" \
+            --template-file infrastructure/main.bicep \
+            --parameters \
+              location="$LOCATION" \
+              baseName="$BASE_NAME" \
+              domainName="$DOMAIN" \
+              vmSize="$VM_SIZE" \
+              n8nVersion="$N8N_VERSION" \
+              sshPublicKey="$SSH_KEY" \
+              n8nEncryptionKey="$ENCRYPTION_KEY" \
+              environment="$ENVIRONMENT" \
+            --query 'properties.outputs' \
+            --output json > deployment-output.json
+          
+          echo ""
+          echo "✅ Bicep deployment completed"
+          echo ""
+          
+          # Parse outputs
+          PUBLIC_IP=$(jq -r '.publicIPAddress.value' deployment-output.json)
+          VM_NAME=$(jq -r '.vmName.value' deployment-output.json)
+          FQDN=$(jq -r '.fqdn.value' deployment-output.json)
+          SSH_CMD=$(jq -r '.sshCommand.value' deployment-output.json)
+          N8N_URL=$(jq -r '.n8nUrl.value' deployment-output.json)
+          VM_ID=$(jq -r '.vmId.value' deployment-output.json)
+          NIC_ID=$(jq -r '.nicId.value' deployment-output.json)
+          
+          # Store outputs
+          echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+          echo "vm_name=$VM_NAME" >> $GITHUB_OUTPUT
+          echo "fqdn=$FQDN" >> $GITHUB_OUTPUT
+          echo "ssh_command=$SSH_CMD" >> $GITHUB_OUTPUT
+          echo "n8n_url=$N8N_URL" >> $GITHUB_OUTPUT
+          echo "vm_id=$VM_ID" >> $GITHUB_OUTPUT
+          echo "nic_id=$NIC_ID" >> $GITHUB_OUTPUT
+          
+          echo "📋 Deployment Outputs:"
+          echo "   Public IP: $PUBLIC_IP"
+          echo "   VM Name: $VM_NAME"
+          echo "   Azure FQDN: $FQDN"
+          echo "   n8n URL: $N8N_URL"
+          echo "   SSH: $SSH_CMD"
+          echo ""
+
+      - name: Wait for VM provisioning
+        run: |
+          echo "⏳ Waiting for VM to be fully provisioned..."
+          echo ""
+          
+          RG_NAME="${{ needs.validate.outputs.rg_name }}"
+          VM_NAME="${{ steps.deploy_bicep.outputs.vm_name }}"
+          
+          MAX_ATTEMPTS=60
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            
+            VM_STATE=$(az vm get-instance-view \
+              --resource-group "$RG_NAME" \
+              --name "$VM_NAME" \
+              --query "instanceView.statuses[?starts_with(code, 'PowerState/')].displayStatus" \
+              -o tsv)
+            
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: VM State = $VM_STATE"
+            
+            if [ "$VM_STATE" = "VM running" ]; then
+              echo "✅ VM is running"
+              break
+            fi
+            
+            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+              echo "⚠️  Timeout waiting for VM"
+              break
+            fi
+            
+            sleep 5
+          done
+          
+          echo ""
+          echo "✅ VM provisioning check complete"
+      
+      - name: Wait for cloud-init completion
+        id: wait_cloudinit
+        run: |
+          echo "⏳ Waiting for cloud-init to complete..."
+          echo "   This may take 5-10 minutes..."
+          echo ""
+          
+          RG_NAME="${{ needs.validate.outputs.rg_name }}"
+          VM_NAME="${{ steps.deploy_bicep.outputs.vm_name }}"
+          
+          MAX_ATTEMPTS=40
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: Checking cloud-init status..."
+            
+            # Check cloud-init status via Azure VM run-command
+            CLOUD_INIT_STATUS=$(az vm run-command invoke \
+              --resource-group "$RG_NAME" \
+              --name "$VM_NAME" \
+              --command-id RunShellScript \
+              --scripts "cloud-init status --wait --long || cloud-init status" \
+              --query "value[0].message" \
+              -o tsv 2>/dev/null || echo "status: error")
+            
+            echo "   Status: $CLOUD_INIT_STATUS"
+            
+            if echo "$CLOUD_INIT_STATUS" | grep -q "status: done"; then
+              echo "✅ cloud-init completed successfully"
+              break
+            fi
+            
+            if echo "$CLOUD_INIT_STATUS" | grep -q "status: error"; then
+              echo "⚠️  cloud-init reported an error"
+              echo ""
+              echo "Fetching cloud-init logs..."
+              az vm run-command invoke \
+                --resource-group "$RG_NAME" \
+                --name "$VM_NAME" \
+                --command-id RunShellScript \
+                --scripts "tail -100 /var/log/cloud-init-output.log" \
+                --query "value[0].message" \
+                -o tsv
+              exit 1
+            fi
+            
+            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+              echo "⚠️  Timeout waiting for cloud-init"
+              echo "   Fetching logs for troubleshooting..."
+              az vm run-command invoke \
+                --resource-group "$RG_NAME" \
+                --name "$VM_NAME" \
+                --command-id RunShellScript \
+                --scripts "tail -100 /var/log/cloud-init-output.log" \
+                --query "value[0].message" \
+                -o tsv
+              exit 1
+            fi
+            
+            sleep 15
+          done
+          
+          echo ""
+          echo "✅ cloud-init setup complete"
+
+      - name: Deployment paused for manual DNS update
+        run: |
+          echo "⏸️ Deployment completed. Manual DNS update required before post-DNS operations."
+          echo ""
+          echo "Update your DNS A record to point to this VM public IP: ${{ steps.deploy_bicep.outputs.public_ip }}"
+          echo "Domain: ${{ needs.validate.outputs.domain }}"
+          echo ""
+          echo "Then run workflow: 04 - Start N8N"
+          echo "Use these inputs:"
+          echo "  resource_group_name=${{ needs.validate.outputs.rg_name }}"
+          echo "  environment=${{ needs.validate.outputs.environment }}"
