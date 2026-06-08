@@ -1,4 +1,4 @@
-# lab-n8n-azure
+# 🔬 lab-n8n-azure
 
 Production-style n8n deployment on Azure, packaged as a small VM-based stack with Bicep, Docker Compose, and GitHub Actions.
 
