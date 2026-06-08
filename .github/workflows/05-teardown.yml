@@ -1,0 +1,291 @@
+name: 05 - Teardown Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to teardown'
+        required: true
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+      resource_group_name:
+        description: 'Resource Group Name (must match exactly)'
+        required: true
+        type: string
+      confirmation:
+        description: 'Type "DELETE" to confirm teardown'
+        required: true
+        type: string
+      skip_backup_check:
+        description: 'Skip backup verification (not recommended for production)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  validate-teardown:
+    runs-on: ubuntu-latest
+    outputs:
+      confirmed: ${{ steps.validate.outputs.confirmed }}
+      rg_name: ${{ steps.validate.outputs.rg_name }}
+      environment: ${{ steps.validate.outputs.environment }}
+    steps:
+      - name: Validate confirmation
+        id: validate
+        run: |
+          echo "🔍 Validating teardown request..."
+          
+          CONFIRMATION="${{ inputs.confirmation }}"
+          ENVIRONMENT="${{ inputs.environment }}"
+          RG_NAME="${{ inputs.resource_group_name }}"
+          
+          # Validate confirmation input
+          if [ "$CONFIRMATION" != "DELETE" ]; then
+            echo "❌ Invalid confirmation. You must type 'DELETE' exactly to proceed."
+            echo "   You typed: $CONFIRMATION"
+            exit 1
+          fi
+          
+          # Validate resource group name format
+          # Only allow deletion of n8n resource groups or Azure NetworkWatcher groups
+          if [[ ! "$RG_NAME" =~ ^rg-n8n- ]] && [[ ! "$RG_NAME" =~ ^NetworkWatcherRG ]]; then
+            echo "❌ Invalid resource group name."
+            echo "   Only these patterns are allowed for deletion:"
+            echo "   • rg-n8n-*  (n8n project resource groups)"
+            echo "   • NetworkWatcherRG*  (Azure Network Watcher groups)"
+            echo ""
+            echo "   You provided: $RG_NAME"
+            exit 1
+          fi
+          
+          echo "✅ Validation passed"
+          echo "confirmed=true" >> $GITHUB_OUTPUT
+          echo "rg_name=$RG_NAME" >> $GITHUB_OUTPUT
+          echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "⚠️  WARNING: This will DELETE all resources in:"
+          echo "   Resource Group: $RG_NAME"
+          echo "   Environment: $ENVIRONMENT"
+          echo "   Region: ${{ vars.AZURE_REGION }}"
+      
+      - name: Production safety check
+        if: inputs.environment == 'production'
+        run: |
+          echo "🔴 PRODUCTION TEARDOWN DETECTED"
+          echo ""
+          echo "⚠️  You are about to delete PRODUCTION resources!"
+          echo "   This action is IRREVERSIBLE."
+          echo ""
+          echo "   Please ensure:"
+          echo "   ✓ You have recent backups"
+          echo "   ✓ All workflows are exported"
+          echo "   ✓ Stakeholders are notified"
+          echo "   ✓ DNS records will be updated"
+          echo ""
+          sleep 5
+
+  teardown:
+    runs-on: ubuntu-latest
+    needs: validate-teardown
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      
+      - name: Check backup status
+        if: inputs.skip_backup_check == false
+        run: |
+          echo "📦 Checking for recent backups..."
+          echo ""
+          
+          RG_NAME="${{ needs.validate-teardown.outputs.rg_name }}"
+          
+          # Check if resource group exists
+          if ! az group exists --name "$RG_NAME" --output tsv | grep -q "true"; then
+            echo "⚠️  Resource group '$RG_NAME' does not exist."
+            echo "   Nothing to teardown."
+            exit 0
+          fi
+          
+          # List VMs in resource group
+          VM_COUNT=$(az vm list --resource-group "$RG_NAME" --query "length(@)" -o tsv)
+          
+          if [ "$VM_COUNT" -eq 0 ]; then
+            echo "ℹ️  No VMs found in resource group."
+          else
+            echo "📋 Found $VM_COUNT VM(s) in resource group"
+            echo ""
+            echo "⚠️  Backup Reminder:"
+            echo "   Before proceeding, ensure you have:"
+            echo "   ✓ Exported all n8n workflows"
+            echo "   ✓ Backed up credentials and settings"
+            echo "   ✓ Downloaded any important data"
+            echo ""
+            
+            if [ "${{ inputs.environment }}" = "production" ]; then
+              echo "🔴 PRODUCTION environment - waiting 10 seconds..."
+              sleep 10
+            else
+              echo "⏸️  Waiting 5 seconds..."
+              sleep 5
+            fi
+          fi
+      
+      - name: List resources to be deleted
+        id: list_resources
+        run: |
+          echo "📋 Resources that will be DELETED:"
+          echo ""
+          
+          RG_NAME="${{ needs.validate-teardown.outputs.rg_name }}"
+          
+          # Check if resource group exists
+          if ! az group exists --name "$RG_NAME" --output tsv | grep -q "true"; then
+            echo "⚠️  Resource group '$RG_NAME' does not exist."
+            echo "exists=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "exists=true" >> $GITHUB_OUTPUT
+          
+          # List all resources
+          echo "🔍 Resource Group: $RG_NAME"
+          echo ""
+          
+          az resource list \
+            --resource-group "$RG_NAME" \
+            --query "[].{Name:name, Type:type, Location:location}" \
+            --output table
+          
+          echo ""
+          
+          # Get resource count
+          RESOURCE_COUNT=$(az resource list --resource-group "$RG_NAME" --query "length(@)" -o tsv)
+          echo "📊 Total resources: $RESOURCE_COUNT"
+          echo ""
+      
+      - name: Delete resource group
+        if: steps.list_resources.outputs.exists == 'true'
+        run: |
+          echo "🗑️  Deleting resource group..."
+          echo ""
+          
+          RG_NAME="${{ needs.validate-teardown.outputs.rg_name }}"
+          
+          echo "⏳ Starting deletion of: $RG_NAME"
+          echo "   This may take 5-10 minutes..."
+          echo ""
+          
+          az group delete \
+            --name "$RG_NAME" \
+            --yes \
+            --no-wait
+          
+          echo "✅ Deletion initiated (running in background)"
+          echo ""
+          echo "⏳ Waiting for deletion to complete..."
+          
+          # Wait for deletion with timeout
+          MAX_ATTEMPTS=60
+          ATTEMPT=0
+          
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            
+            if ! az group exists --name "$RG_NAME" --output tsv | grep -q "true"; then
+              echo "✅ Resource group deleted successfully"
+              break
+            fi
+            
+            if [ $((ATTEMPT % 10)) -eq 0 ]; then
+              echo "   Still deleting... ($ATTEMPT/$MAX_ATTEMPTS attempts)"
+            fi
+            
+            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+              echo "⚠️  Deletion is taking longer than expected"
+              echo "   The deletion is still in progress in the background"
+              echo "   Check Azure Portal for status"
+              break
+            fi
+            
+            sleep 10
+          done
+      
+      - name: Verify deletion
+        if: steps.list_resources.outputs.exists == 'true'
+        run: |
+          echo "🔍 Verifying deletion..."
+          echo ""
+          
+          RG_NAME="${{ needs.validate-teardown.outputs.rg_name }}"
+          
+          if az group exists --name "$RG_NAME" --output tsv | grep -q "true"; then
+            echo "⚠️  Resource group still exists (deletion in progress)"
+            echo ""
+            echo "   To check status, run:"
+            echo "   az group show --name $RG_NAME --query properties.provisioningState"
+          else
+            echo "✅ Resource group deleted successfully"
+            echo ""
+            echo "🎯 Teardown complete!"
+          fi
+      
+      - name: Cleanup reminders
+        if: always()
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📝 Post-Teardown Checklist"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "Manual cleanup tasks:"
+          echo ""
+          echo "1. 🌐 Update DNS records"
+          echo "   └─ Remove CNAME/A record for: n8n.${{ vars.DOMAIN_NAME || 'your-domain.com' }}"
+          echo ""
+          echo "2. 🔑 GitHub Secrets (Optional)"
+          echo "   └─ Consider rotating: SSH_PUBLIC_KEY, N8N_ENCRYPTION_KEY"
+          echo ""
+          echo "3. 📊 Verify in Azure Portal"
+          echo "   └─ Confirm resource group is deleted"
+          echo ""
+          echo "4. 💰 Cost Management"
+          echo "   └─ Check for any remaining costs in Azure"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "✅ Teardown workflow complete"
+
+  notify-completion:
+    runs-on: ubuntu-latest
+    needs: [validate-teardown, teardown]
+    if: always()
+    steps:
+      - name: Teardown summary
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🗑️  Teardown Summary"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "Environment: ${{ needs.validate-teardown.outputs.environment }}"
+          echo "Resource Group: ${{ needs.validate-teardown.outputs.rg_name }}"
+          echo "Status: ${{ job.status }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
