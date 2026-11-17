@@ -112,3 +112,7 @@ Open your HTTPS URL and confirm the n8n UI is reachable.
 ### 8. Optional cleanup with `05-teardown.yml`
 
 When you need to remove the environment, run teardown with explicit confirmation (`DELETE`). Use this only when you are ready to delete the resource group and all contained resources.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution and pull request guidance.
